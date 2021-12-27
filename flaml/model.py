@@ -428,6 +428,8 @@ class DistiliingEstimator(TransformersEstimator):
     modify ml.py by: adding import at L34, set estimator_class at L116
     """
 
+    ITER_HP = "global_max_steps"
+
     from transformers import (
     WEIGHTS_NAME,
     AdamW,
@@ -853,12 +855,13 @@ class DistiliingEstimator(TransformersEstimator):
     #     return dataset
 
 
-    def fit(self, dataset, budget=None, **kwargs):
+    def fit(self,X_train: DataFrame, y_train: Series, budget=None, **kwargs):
+        from transformers import EarlyStoppingCallback
+        from datasets import Dataset
         from transformers.trainer_utils import set_seed
         from transformers import AutoTokenizer
 
         import transformers
-        from datasets import load_dataset
         from .nlp.utils import (
             get_num_labels,
             separate_config,
@@ -867,11 +870,47 @@ class DistiliingEstimator(TransformersEstimator):
             get_trial_fold_name,
             date_str,
         )
-        import logging
 
-        logger = logging.getLogger(__name__)
+        # TODO: if self._task == QUESTIONANSWERING, uncomment the code below (add indentation before
+        #  from .nlp.huggingface.trainer import TrainerForAuto)
+
+        # if self._task in NLG_TASKS:
+        #     from .nlp.huggingface.trainer import Seq2SeqTrainerForAuto as TrainerForAuto
+        # else:
+        from .nlp.huggingface.trainer import TrainerForAuto
 
         this_params = self.params
+
+        class EarlyStoppingCallbackForAuto(EarlyStoppingCallback):
+            def on_train_begin(self, args, state, control, **callback_kwargs):
+                self.train_begin_time = time.time()
+
+            def on_step_begin(self, args, state, control, **callback_kwargs):
+                self.step_begin_time = time.time()
+
+            def on_step_end(self, args, state, control, **callback_kwargs):
+                if state.global_step == 1:
+                    self.time_per_iter = time.time() - self.step_begin_time
+                if (
+                    budget
+                    and (
+                        time.time() + self.time_per_iter
+                        > self.train_begin_time + budget
+                    )
+                    or state.global_step >= this_params[FineTuningEstimator.ITER_HP]
+                ):
+                    control.should_training_stop = True
+                    control.should_save = True
+                    control.should_evaluate = True
+                return control
+
+            def on_epoch_end(self, args, state, control, **callback_kwargs):
+                if (
+                    control.should_training_stop
+                    or state.epoch + 1 >= args.num_train_epochs
+                ):
+                    control.should_save = True
+                    control.should_evaluate = True
 
         set_seed(self.params.get("seed", self._TrainingArguments.seed))
 
@@ -879,6 +918,35 @@ class DistiliingEstimator(TransformersEstimator):
         self._metric_name = kwargs["metric"]
         if hasattr(self, "use_ray") is False:
             self.use_ray = kwargs["use_ray"]
+
+        X_val = kwargs.get("X_val")
+        y_val = kwargs.get("y_val")
+
+        if self._task not in NLG_TASKS:
+            X_train, _ = self._preprocess(X=X_train, task=self._task, **kwargs)
+        else:
+            X_train, y_train = self._preprocess(
+                X=X_train, y=y_train, task=self._task, **kwargs
+            )
+
+        train_dataset = Dataset.from_pandas(self._join(X_train, y_train))
+
+        # TODO: set a breakpoint here, observe the resulting train_dataset,
+        #  compare it with the output of the tokenized results in your transformer example
+        #  for example, if your task is MULTIPLECHOICE, you need to compare train_dataset with
+        #  the output of https://github.com/huggingface/transformers/blob/master/examples/pytorch/multiple-choice/run_swag.py#L329
+        #  make sure they are the same
+
+        if X_val is not None:
+            if self._task not in NLG_TASKS:
+                X_val, _ = self._preprocess(X=X_val, task=self._task, **kwargs)
+            else:
+                X_val, y_val = self._preprocess(
+                    X=X_val, y=y_val, task=self._task, **kwargs
+                )
+            eval_dataset = Dataset.from_pandas(self._join(X_val, y_val))
+        else:
+            eval_dataset = None
 
 
         # TODO: set a breakpoint here, observe the resulting train_dataset,
@@ -892,11 +960,11 @@ class DistiliingEstimator(TransformersEstimator):
         )
         self._tokenizer = tokenizer
 
+        num_labels = get_num_labels(self._task, y_train)
+
         training_args_config, per_model_config = separate_config(
             self.params, self._task
         )
-
-        train_dataset = self.load_examples(training_args_config, tokenizer, dataset, evaluate=False, output_examples=False)
 
         ckpt_freq = compute_checkpoint_freq(
             train_data_size=len(train_dataset),
@@ -967,19 +1035,176 @@ class DistiliingEstimator(TransformersEstimator):
                 num_labels=None,
             )
 
+        self._model = TrainerForAuto(
+            args=training_args,
+            teacher=self.teacher,
+            model_init=self.student,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            tokenizer=tokenizer,
+            compute_metrics=self._compute_metrics_by_dataset_name,
+            callbacks=[EarlyStoppingCallbackForAuto],
+        )
+
         setattr(self._model, "_use_ray", self.use_ray)
         if self._task in NLG_TASKS:
             setattr(self._model, "_is_seq2seq", True)
-        self.train(training_args,train_dataset, self.student, tokenizer, logger, teacher=self.teacher)
+        self._model.train()
 
-        self.params[self.ITER_HP] = self.student.state.global_step
-        self._checkpoint_path = self._select_checkpoint(self.student)
+        self.params[self.ITER_HP] = self._model.state.global_step
+        self._checkpoint_path = self._select_checkpoint(self._model)
 
         self._kwargs = kwargs
+        self._num_labels = num_labels
         self._per_model_config = per_model_config
         self._training_args_config = training_args_config
 
         self._ckpt_remains = list(self._model.ckpt_to_metric.keys())
+
+    def _delete_one_ckpt(self, ckpt_location):
+        if self.use_ray is False:
+            try:
+                shutil.rmtree(ckpt_location)
+            except FileNotFoundError:
+                logger.warning("checkpoint {} not found".format(ckpt_location))
+
+    def cleanup(self):
+        super().cleanup()
+        if hasattr(self, "_ckpt_remains"):
+            for each_ckpt in self._ckpt_remains:
+                self._delete_one_ckpt(each_ckpt)
+
+    def _select_checkpoint(self, trainer):
+        from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+
+        if trainer.ckpt_to_metric:
+            best_ckpt, _ = min(
+                trainer.ckpt_to_metric.items(), key=lambda x: x[1]["val_loss"]
+            )
+            best_ckpt_global_step = trainer.ckpt_to_global_step[best_ckpt]
+            for each_ckpt in list(trainer.ckpt_to_metric):
+                if each_ckpt != best_ckpt:
+                    del trainer.ckpt_to_metric[each_ckpt]
+                    del trainer.ckpt_to_global_step[each_ckpt]
+                    self._delete_one_ckpt(each_ckpt)
+        else:
+            best_ckpt_global_step = trainer.state.global_step
+            best_ckpt = os.path.join(
+                trainer.args.output_dir,
+                f"{PREFIX_CHECKPOINT_DIR}-{best_ckpt_global_step}",
+            )
+        self.params[self.ITER_HP] = best_ckpt_global_step
+        print(trainer.state.global_step)
+        print(trainer.ckpt_to_global_step)
+        return best_ckpt
+
+    def _compute_metrics_by_dataset_name(self, eval_pred):
+        from .ml import metric_loss_score
+        from .nlp.utils import postprocess_text
+
+        predictions, labels = eval_pred
+
+        if self._task in NLG_TASKS:
+            if isinstance(predictions, tuple):
+                predictions = np.argmax(predictions[0], axis=2)
+            decoded_preds = self._tokenizer.batch_decode(
+                predictions, skip_special_tokens=True
+            )
+            labels = np.where(labels != -100, labels, self._tokenizer.pad_token_id)
+            decoded_labels = self._tokenizer.batch_decode(
+                labels, skip_special_tokens=True
+            )
+            predictions, labels = postprocess_text(decoded_preds, decoded_labels)
+        else:
+            predictions = (
+                np.squeeze(predictions)
+                if self._task == SEQREGRESSION
+                else np.argmax(predictions, axis=1)
+            )
+
+        return {
+            "val_loss": metric_loss_score(
+                metric_name=self._metric_name, y_predict=predictions, y_true=labels
+            )
+        }
+
+    def predict_proba(self, X_test):
+        assert (
+            self._task in CLASSIFICATION
+        ), "predict_proba() only for classification tasks."
+
+        from datasets import Dataset
+        from .nlp.huggingface.trainer import TrainerForAuto
+        from transformers import TrainingArguments
+        from .nlp.utils import load_model
+
+        X_test, _ = self._preprocess(X_test, task=self._task, **self._kwargs)
+        test_dataset = Dataset.from_pandas(X_test)
+
+        best_model = load_model(
+            checkpoint_path=self._checkpoint_path,
+            task=self._task,
+            num_labels=self._num_labels,
+            per_model_config=self._per_model_config,
+        )
+        training_args = TrainingArguments(
+            per_device_eval_batch_size=1,
+            output_dir=self.custom_hpo_args.output_dir,
+        )
+        self._model = TrainerForAuto(model=best_model, args=training_args)
+        predictions = self._model.predict(test_dataset)
+        return predictions.predictions
+
+    def predict(self, X_test):
+        from datasets import Dataset
+        from .nlp.utils import load_model
+        from .nlp.huggingface.trainer import TrainerForAuto
+
+        X_test, _ = self._preprocess(X=X_test, task=self._task, **self._kwargs)
+        test_dataset = Dataset.from_pandas(X_test)
+
+        best_model = load_model(
+            checkpoint_path=self._checkpoint_path,
+            task=self._task,
+            num_labels=self._num_labels,
+            per_model_config=self._per_model_config,
+        )
+        training_args = self._TrainingArguments(
+            per_device_eval_batch_size=1,
+            output_dir=self.custom_hpo_args.output_dir,
+            **self._training_args_config,
+        )
+        self._model = TrainerForAuto(model=best_model, args=training_args)
+        if self._task not in NLG_TASKS:
+            predictions = self._model.predict(test_dataset)
+        else:
+            predictions = self._model.predict(
+                test_dataset,
+                max_length=training_args.generation_max_length,
+                num_beams=training_args.generation_num_beams,
+            )
+
+        if self._task == SEQCLASSIFICATION:
+            return np.argmax(predictions.predictions, axis=1)
+        elif self._task == SEQREGRESSION:
+            return predictions.predictions
+        # TODO: elif self._task == your task, return the corresponding prediction
+        #  e.g., if your task == QUESTIONANSWERING, you need to return the answer instead
+        #  of the index
+        elif self._task == SUMMARIZATION:
+            if isinstance(predictions.predictions, tuple):
+                predictions = np.argmax(predictions.predictions[0], axis=2)
+            decoded_preds = self._tokenizer.batch_decode(
+                predictions, skip_special_tokens=True
+            )
+            return decoded_preds
+
+    def config2params(self, config: dict) -> dict:
+        params = config.copy()
+        params[FineTuningEstimator.ITER_HP] = params.get(
+            FineTuningEstimator.ITER_HP, sys.maxsize
+        )
+        return params
 
     
 ################# END ADDED BY QSONG #################
