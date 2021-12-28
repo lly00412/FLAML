@@ -1,18 +1,7 @@
 import argparse
 from dataclasses import dataclass, field
 from typing import Dict, Any
-
-from ..data import (
-    QUESTIONANSWERING,
-    SUMMARIZATION,
-    SEQREGRESSION,
-    SEQCLASSIFICATION,
-    NLG_TASKS,
-    QUESTIONANSWERING
-)
-# =======
 from ..data import SUMMARIZATION, SEQREGRESSION, SEQCLASSIFICATION, NLG_TASKS
-# >>>>>>> upstream/main
 
 
 def load_default_huggingface_metric_for_task(task):
